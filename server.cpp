@@ -1,5 +1,6 @@
 //server.cpp完成接收端部分
 #include"UDP programming.h"
+#include<map>
 
 std::fstream Server_log;
 static int wndSize;
@@ -11,8 +12,7 @@ static int addrlen;
 static u_short NowSeq = 0;
 static u_short NowAck = 0;
 
-std::queue<msg> msgCache;
-std::queue<int> seqCache;
+std::map<int, msg> msgCache;
 
 std::fstream file;
 std::string filename;
@@ -183,25 +183,31 @@ int _Server::recvfile() { //接收文件的函数
 			logger(str,sysTime);
 		}
 		else {
-			recvLog(recvMsg);
-			std::cout << recvMsg.seq << std::endl;
-			if (recvMsg.checkValid(&recvHead) && recvMsg.seq == NowAck) { // 校验和正确 并且Seq与Ack对应
+			if (recvMsg.checkValid(&recvHead) && recvMsg.seq == NowAck) { // 校验和正确 并且Seq与Ack对应，顺序确认
+				recvLog(recvMsg);
 				handleMsg(recvMsg);
 				if (recvMsg.if_FIN()) {
 					return 0;
 				}
-				while (!seqCache.empty() && seqCache.front() == NowAck) {
-					handleMsg(msgCache.front(),false);
+				while (!msgCache.empty() && msgCache.find(NowAck)!=msgCache.end()) {  //如果此时缓存中有下一个要接受的分组，进行接收
+					recvMsg = msgCache[NowAck];
+					sprintf(info, "[Log] Get Package %d from Cache!\n", recvMsg.seq);
+					std::string str = info;
+					GetSystemTime(&sysTime);
+					logger(str, sysTime);
+					handleMsg(recvMsg,false);
+					msgCache.erase(NowAck);
 					NowAck++;
-					seqCache.pop();
-					msgCache.pop();
 				}
 			}
-			else { //如果校验和出错，或seq与ack不对应，则返回上一次的ack
-				if (!recvMsg.if_FIN()) {
+			else { 
+				if (!recvMsg.if_FIN() && recvMsg.checkValid(&recvHead)) {//如果校验和正确，但是乱序，可以提前确认（FIN消息不可提前确认）
+					sprintf(info, "[Log] Recieve Package %d, disorder! Store in Cache!\n", recvMsg.seq);
+					std::string str = info;
+					GetSystemTime(&sysTime);
+					logger(str, sysTime);
 					file_accept(recvMsg.seq + 1);
-					msgCache.push(recvMsg);
-					seqCache.push(recvMsg.seq);
+					msgCache[recvMsg.seq] = recvMsg;
 				}
 			}
 

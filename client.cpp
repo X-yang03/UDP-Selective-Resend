@@ -4,15 +4,16 @@
 #include <WinSock.h>
 #include <IPHlpApi.h>
 #include <map>
+#include <set>
 
 static std::fstream Client_log; //日志输出，保存为client_log.txt
 
 std::deque<msg> Cache;		//数据缓冲区
 std::deque<msg> CurrWnd;    //当前窗口
+std::deque<DWORD*> timeStamp; //当前窗口的时间戳,存储其地址，方便后续重传时更改时间戳
 
-std::deque<int> AckCache;
-int isack = 0;
-int tobeack = 1;
+
+std::set<int> AckCache;
 
 static int wndSize = 0;
 SOCKET Client;
@@ -35,7 +36,7 @@ static std::string currentPath = "./test/";
 std::shared_mutex cache_mutex;    //通过mutex类,防止线程之间冲突
 std::shared_mutex wnd_mutex;
 std::shared_mutex log_mutex;
-std::shared_mutex ack_mutex;
+std::shared_mutex map_mutex;
 
 
 int CachePush(msg message) {    //将对Cache队列的操作封装为线程安全的
@@ -48,34 +49,28 @@ msg CachePop() {
 	std::unique_lock lock(cache_mutex);
 	msg message = Cache.front();
 	Cache.pop_front();
+
 	return message;
 }
 
 
-int wndPush(msg m) {
-	std::unique_lock lock(wnd_mutex);
-	CurrWnd.push_back(m);
+int wndPush(msg m) {    //封装为线程安全的窗口更新函数，用于将分组加入窗口
+	std::unique_lock lock(wnd_mutex);   //用uniqu_lock，保证线程安全
+	CurrWnd.push_back(m);				//分组加入窗口
+	DWORD* sendTime = new DWORD;
+	*sendTime = GetTickCount();			//获取当前的时间sendTime
+	timeStamp.push_back(sendTime);		//将时间戳加入timeStamp队列
 	return 0;
 }
 
-int wndPop() {
-	std::unique_lock lock(wnd_mutex);
-	CurrWnd.pop_front();
+int wndPop() {		//封装为线程安全的窗口更新函数，用于将窗口头部的分组弹出窗口
+	std::unique_lock lock(wnd_mutex);	//用uniqu_lock，保证线程安全
+	CurrWnd.pop_front();				//弹出分组
+	DWORD* stamp = timeStamp.front();
+	timeStamp.pop_front();				//弹出时间戳
+	delete stamp;
 	return 0;
 }
-
-int ackPop() {
-	std::unique_lock lock(ack_mutex);
-	AckCache.pop_front();
-	return 0;
-}
-
-int ackPush(int ack) {
-	std::unique_lock lock(ack_mutex);
-	AckCache.push_back(ack);
-	return 0;
-}
-
 
 
 
@@ -184,6 +179,9 @@ int _Client::start_client() {
 
 	cnt_setup();  //建立握手
 
+	unsigned long on = 1;  //0会将套接字设置为阻塞,1设置为非阻塞
+	ioctlsocket(Client, FIONBIO, &on);
+
 	//修改缓冲区大小(其实发送端缓冲区不重要, 接收端缓冲区大小才是关键)
 	int buffer_size = wndSize * MSS;
 	setsockopt(Client, SOL_SOCKET, SO_SNDBUF, (const char*)&buffer_size, sizeof(buffer_size));
@@ -213,24 +211,47 @@ int _Client::start_client() {
 
 }
 
+void CheckTimeOut() {
+		std::unique_lock lock(wnd_mutex); //需要加上unique_lock锁，保证线程安全，以及遍历检查时队列不被更改
+		SYSTEMTIME sysTime;
+		int i = 0;
+		for (auto stamp = timeStamp.begin(); stamp != timeStamp.end(); stamp++) {
+			DWORD* sendTime = *stamp;
+			DWORD nowTime = GetTickCount();  //GetTickCount，获取开机以来的微秒数
+			//nowTime是当前时间，sendTime是发送时间，如果之差大于wait_time,说明超时
+			if (nowTime - *sendTime > wait_time) {
+				msg toResend = CurrWnd[i];		//获取窗口内要重发的分组
+				if (AckCache.find(toResend.seq + 1) == AckCache.end())
+				{
+					sendto(Client, (char*)&toResend, sizeof(msg), 0, (struct sockaddr*)&server_addr, addrlen);
+					*sendTime = nowTime;		//更新时间戳，将sendTime的值更新为nowTime
+					char info[100];
+					sprintf(info, "[Rsd] Time out ! Resend Package %d!\n", toResend.seq);
+					std::string s = info;
+					GetSystemTime(&sysTime);
+					logger(s, sysTime);
+				}
+			}
+			i++;
+		}
+}
+
 void _Client::recvAcks() {
 	std::thread recvacks([&]() {
 		SYSTEMTIME sysTime;
 		while (true) {
 			msg recvBuff;
 			int recvLen = recvfrom(Client, (char*)&recvBuff, sizeof(msg), 0, (struct sockaddr*)&server_addr, &addrlen);
-			// if receive buffer is valid
 			if (recvLen > 0) {
-				if (recvBuff.checkValid(&recvHead) && recvBuff.ack > baseSeq && (recvBuff.ack <= baseSeq + wndSize)) { //校验和正确且ack和seq能对应,此外的情况不做处理,进行忽略
+				if (recvBuff.checkValid(&recvHead) && recvBuff.ack > baseSeq && (recvBuff.ack <= baseSeq + wndSize)) { //校验和正确且ack在窗口范围之内（已发送的被确认）
 					int acked = recvBuff.ack - 1;
-					if (acked == baseSeq) {
+					if (acked == baseSeq) { //窗口头部的被确认（顺序确认）
 						recvLog(recvBuff);
 						wndPop();
 						baseSeq++;
-						while (!AckCache.empty() && AckCache.front() == baseSeq+1) {
-							//std::cout << AckCache.front() <<" "<<baseSeq<< CurrWnd.front().seq<< std::endl;
-							ackPop();
-							wndPop();
+						while (!AckCache.empty() && AckCache.find(baseSeq+1)!=AckCache.end()) {  //如果缓存中有这之后的分组的ack
+							AckCache.erase(baseSeq+1);   // 从记录的ACK中删去baseSeq+1
+							wndPop();			//用缓存的ack进行确认，窗口滑动
 							baseSeq++;
 							char info[100];
 							sprintf(info, "[Log] Package %d accepted by ack in Cache, \tbaseSeq = %d, nextSeq = %d, wndSize = %d\n", baseSeq-1, baseSeq,nextSeq, CurrWnd.size());
@@ -239,14 +260,15 @@ void _Client::recvAcks() {
 							logger(str, sysTime);
 						}
 					}
-					else{
-						ackPush(recvBuff.ack);
+					else{   //乱序确认
+						AckCache.insert(recvBuff.ack);   //记录下这个ack
 						char info[100];
-						sprintf(info, "[Log] Recieve Ack %d, store in Cache! \t checkSum = %d ,\t wndSize = %d\n", recvBuff.ack, recvBuff.ack - 1, recvBuff.check, CurrWnd.size());
+						sprintf(info, "[Log] Recieve Ack %d, store in Cache! \t checkSum = %d ,\t wndSize = %d\n", recvBuff.ack, recvBuff.check, CurrWnd.size());
 						std::string str = info;
 						GetSystemTime(&sysTime);
 						logger(str, sysTime);
 					}
+
 					if (recvBuff.if_FIN() && recvBuff.if_ACK()) {
 						//挥手信息
 						std::string s("[FIN] Destroy the connection!");
@@ -257,16 +279,9 @@ void _Client::recvAcks() {
 					}
 				}
 			}
-			else {
-				msg rsndMsg = CurrWnd.front();
-				sendto(Client, (char*)&rsndMsg, sizeof(msg), 0, (struct sockaddr*)&server_addr, addrlen);
-				char info[100];
-				sprintf(info, "[Rsd] Time out ! Resend Package %d!\n", rsndMsg.seq);
-				std::string s = info;
-				GetSystemTime(&sysTime);
-				logger(s, sysTime);
+			//如果当前窗口非空，则检查是否有分组超时，配合非阻塞的recvfrom，可以做到快速轮询的效果
+			if(!CurrWnd.empty()) CheckTimeOut();
 
-			}
 		}
 		});
 	recvacks.detach();
@@ -285,7 +300,7 @@ void _Client::sendFiles() {
 				message.set_seq(nextSeq);
 				message.set_check(&sendHead);
 				wndPush(message);		//加入窗口,并发送
-				if (!lossSet || nextSeq % (lossrate + 1)) {  //没有发生丢包，或没有设置丢包率
+				if (!lossSet || nextSeq % (lossrate + 1)) {  //没有发生丢包，或没有设置丢包率，正常发送
 					Sleep(delay);	//延迟用Sleep实现
 					sendto(Client, (char*)&message, sizeof(msg), 0, (struct sockaddr*)&server_addr, addrlen);
 					sendLog(message);
